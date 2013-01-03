@@ -16,6 +16,7 @@
 #include <linux/types.h>
 #ifdef __KERNEL__
 
+#include <linux/ktime.h>
 #include <linux/list.h>
 #include <linux/spinlock.h>
 #include <linux/wait.h>
@@ -32,12 +33,10 @@ struct sync_fence;
  *			  1 if pt has signaled
  *			  0 if pt has not signaled
  *			 <0 on error
- *			must be callable from atomic context
  * @compare:		returns:
  *			  1 if b will signal before a
  *			  0 if a and b will signal at the same time
  *			 -1 if a will signabl before b
- *			must be callable from atomic context
  * @free_pt:		called before sync_pt is freed
  * @release_obj:	called before sync_timeline is freed
  * @print_obj:		print aditional debug information about sync_timeline.
@@ -113,6 +112,8 @@ struct sync_timeline {
  * @fence:		sync_fence to which the sync_pt belongs
  * @pt_list:		membership in sync_fence.pt_list_head
  * @status:		1: signaled, 0:active, <0: error
+ * @timestamp:		time which sync_pt status transitioned from active to
+ *			  singaled or error.
  */
 struct sync_pt {
 	struct sync_timeline		*parent;
@@ -125,6 +126,8 @@ struct sync_pt {
 
 	/* protected by parent->active_list_lock */
 	int			status;
+
+	ktime_t			timestamp;
 };
 
 /**
@@ -156,10 +159,6 @@ struct sync_fence {
 	struct list_head	sync_fence_list;
 };
 
-struct sync_fence_waiter;
-typedef void (*sync_callback_t)(struct sync_fence *fence,
-				struct sync_fence_waiter *waiter);
-
 /**
  * struct sync_fence_waiter - metadata for asynchronous waiter on a fence
  * @waiter_list:	membership in sync_fence.waiter_list_head
@@ -169,14 +168,9 @@ typedef void (*sync_callback_t)(struct sync_fence *fence,
 struct sync_fence_waiter {
 	struct list_head	waiter_list;
 
-	sync_callback_t		callback;
+	void (*callback)(struct sync_fence *fence, void *data);
+	void *callback_data;
 };
-
-static inline void sync_fence_waiter_init(struct sync_fence_waiter *waiter,
-					  sync_callback_t callback)
-{
-	waiter->callback = callback;
-}
 
 /*
  * API for sync_timeline implementers
@@ -290,29 +284,16 @@ void sync_fence_install(struct sync_fence *fence, int fd);
 /**
  * sync_fence_wait_async() - registers and async wait on the fence
  * @fence:		fence to wait on
- * @waiter:		waiter callback struck
+ * @callback:		callback
+ * @callback_data	data to pass to the callback
  *
  * Returns 1 if @fence has already signaled.
  *
- * Registers a callback to be called when @fence signals or has an error.
- * @waiter should be initialized with sync_fence_waiter_init().
+ * Registers a callback to be called when @fence signals or has an error
  */
 int sync_fence_wait_async(struct sync_fence *fence,
-			  struct sync_fence_waiter *waiter);
-
-/**
- * sync_fence_cancel_async() - cancels an async wait
- * @fence:		fence to wait on
- * @waiter:		waiter callback struck
- *
- * returns 0 if waiter was removed from fence's async waiter list.
- * returns -ENOENT if waiter was not found on fence's async waiter list.
- *
- * Cancels a previously registered async wait.  Will fail gracefully if
- * @waiter was never registered or if @fence has already signaled @waiter.
- */
-int sync_fence_cancel_async(struct sync_fence *fence,
-			    struct sync_fence_waiter *waiter);
+			  void (*callback)(struct sync_fence *, void *data),
+			  void *callback_data);
 
 /**
  * sync_fence_wait() - wait on fence
@@ -407,3 +388,4 @@ struct sync_fence_info_data {
 	struct sync_fence_info_data)
 
 #endif /* _LINUX_SYNC_H */
+

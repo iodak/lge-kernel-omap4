@@ -183,11 +183,16 @@ void sync_pt_free(struct sync_pt *pt)
 /* call with pt->parent->active_list_lock held */
 static int _sync_pt_has_signaled(struct sync_pt *pt)
 {
+	int old_status = pt->status;
+
 	if (!pt->status)
 		pt->status = pt->parent->ops->has_signaled(pt);
 
 	if (!pt->status && pt->parent->destroyed)
 		pt->status = -ENOENT;
+
+	if (pt->status != old_status)
+		pt->timestamp = ktime_get();
 
 	return pt->status;
 }
@@ -416,22 +421,33 @@ static void sync_fence_signal_pt(struct sync_pt *pt)
 				container_of(pos, struct sync_fence_waiter,
 					     waiter_list);
 
+			waiter->callback(fence, waiter->callback_data);
 			list_del(pos);
-			waiter->callback(fence, waiter);
+			kfree(waiter);
 		}
 		wake_up(&fence->wq);
 	}
 }
 
 int sync_fence_wait_async(struct sync_fence *fence,
-			  struct sync_fence_waiter *waiter)
+			  void (*callback)(struct sync_fence *, void *data),
+			  void *callback_data)
 {
+	struct sync_fence_waiter *waiter;
 	unsigned long flags;
 	int err = 0;
+
+	waiter = kzalloc(sizeof(struct sync_fence_waiter), GFP_KERNEL);
+	if (waiter == NULL)
+		return -ENOMEM;
+
+	waiter->callback = callback;
+	waiter->callback_data = callback_data;
 
 	spin_lock_irqsave(&fence->waiter_list_lock, flags);
 
 	if (fence->status) {
+		kfree(waiter);
 		err = fence->status;
 		goto out;
 	}
@@ -441,34 +457,6 @@ out:
 	spin_unlock_irqrestore(&fence->waiter_list_lock, flags);
 
 	return err;
-}
-
-int sync_fence_cancel_async(struct sync_fence *fence,
-			     struct sync_fence_waiter *waiter)
-{
-	struct list_head *pos;
-	struct list_head *n;
-	unsigned long flags;
-	int ret = -ENOENT;
-
-	spin_lock_irqsave(&fence->waiter_list_lock, flags);
-	/*
-	 * Make sure waiter is still in waiter_list because it is possible for
-	 * the waiter to be removed from the list while the callback is still
-	 * pending.
-	 */
-	list_for_each_safe(pos, n, &fence->waiter_list_head) {
-		struct sync_fence_waiter *list_waiter =
-			container_of(pos, struct sync_fence_waiter,
-				     waiter_list);
-		if (list_waiter == waiter) {
-			list_del(pos);
-			ret = 0;
-			break;
-		}
-	}
-	spin_unlock_irqrestore(&fence->waiter_list_lock, flags);
-	return ret;
 }
 
 int sync_fence_wait(struct sync_fence *fence, long timeout)
@@ -580,7 +568,7 @@ err_put_fd:
 	return err;
 }
 
-static int sync_fill_pt_info(struct sync_pt *pt, void *data, int size)
+int sync_fill_pt_info(struct sync_pt *pt, void *data, int size)
 {
 	struct sync_pt_info *info = data;
 	int ret;
@@ -607,6 +595,7 @@ static int sync_fill_pt_info(struct sync_pt *pt, void *data, int size)
 
 	return info->len;
 }
+
 
 static long sync_fence_ioctl_fence_info(struct sync_fence *fence,
 					unsigned long arg)
@@ -751,7 +740,8 @@ static void sync_print_fence(struct seq_file *s, struct sync_fence *fence)
 			container_of(pos, struct sync_fence_waiter,
 				     waiter_list);
 
-		seq_printf(s, "waiter %pF\n", waiter->callback);
+		seq_printf(s, "waiter %pF %p\n", waiter->callback,
+			   waiter->callback_data);
 	}
 	spin_unlock_irqrestore(&fence->waiter_list_lock, flags);
 }
@@ -809,3 +799,4 @@ static __init int sync_debugfs_init(void)
 late_initcall(sync_debugfs_init);
 
 #endif
+
